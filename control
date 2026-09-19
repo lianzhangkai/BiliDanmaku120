@@ -1,8 +1,8 @@
 Package: com.chatgpt.bilidanmaku120
 Name: BiliDanmaku120
-Version: 0.3.1
+Version: 0.3.2
 Architecture: iphoneos-arm
-Description: Exact Bilibili iOS 13 danmaku callback probe. Counts one verified BFC render callback without global CADisplayLink hooks, safely tests only BFCCRONRenderViewV2 layer speed, and dumps exact clock/time structure for the next decoupling step.
+Description: Bilibili iOS 13 danmaku clock probe. Keeps the safe exact 120Hz callback counter, removes ineffective layer-speed mutation, scans loaded danmaku/comment classes, and read-only probes CRON time-step behavior for independent-motion targeting.
 Maintainer: ChatGPT
 Author: ChatGPT
 Section: Tweaks
