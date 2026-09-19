@@ -1,0 +1,9 @@
+Package: com.chatgpt.bilidanmaku120
+Name: BiliDanmaku120
+Version: 0.2.0
+Architecture: iphoneos-arm
+Description: Bilibili iOS 13 danmaku 120Hz + normal-speed motion. Keeps matched danmaku display links at 120Hz while clamping likely danmaku clock/renderer playback speed above 1x back to 1x, so 2x/3x video can keep smoother but readable 1x danmaku movement. Includes runtime diagnostics.
+Maintainer: ChatGPT
+Author: ChatGPT
+Section: Tweaks
+Depends: firmware (>= 13.0), mobilesubstrate | org.coolstar.libhooker

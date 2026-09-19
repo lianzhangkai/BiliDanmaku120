@@ -1,0 +1,57 @@
+name: Build BiliDanmaku120 0.1.0 iOS 13 old-ABI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make curl xz-utils lzma libtinfo5 perl python3 dpkg-dev fakeroot
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Install iPhoneOS 13.7 SDK
+        run: |
+          mkdir -p "$HOME/theos/sdks"
+          curl -L --fail --retry 3 \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS13.7.sdk.tar.xz \
+            -o /tmp/iPhoneOS13.7.sdk.tar.xz
+          tar -xJf /tmp/iPhoneOS13.7.sdk.tar.xz -C "$HOME/theos/sdks"
+
+      - name: Install clang 10 old-arm64e toolchain
+        run: |
+          curl -L --fail --retry 3 \
+            https://github.com/sbingner/llvm-project/releases/download/v10.0.0-1/linux-ios-arm64e-clang-toolchain.tar.lzma \
+            -o /tmp/oldabi-toolchain.tar.lzma
+          mkdir -p /tmp/oldabi-toolchain
+          tar --lzma -xf /tmp/oldabi-toolchain.tar.lzma -C /tmp/oldabi-toolchain
+          cd /tmp/oldabi-toolchain/ios-arm64e-clang-toolchain/bin
+          find * ! -name clang-10 ! -name ldid ! -name ld64 -exec mv {} arm64-apple-darwin14-{} \;
+          find * -xtype l -exec sh -c 'target=$(readlink "$1"); ln -f -s "arm64-apple-darwin14-${target}" "$1"' _ {} \;
+          mkdir -p "$HOME/theos/toolchain/linux/iphone"
+          cp -a /tmp/oldabi-toolchain/ios-arm64e-clang-toolchain/. "$HOME/theos/toolchain/linux/iphone/"
+
+      - name: Build deb
+        env:
+          THEOS: ${{ env.THEOS }}
+        run: |
+          make clean package FINALPACKAGE=1 messages=yes
+          find packages -maxdepth 1 -type f -name '*.deb' -print
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliDanmaku120-0.1.0-iOS13
+          path: packages/*.deb
