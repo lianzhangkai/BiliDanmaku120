@@ -2,11 +2,12 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <substrate.h>
 #include <stdint.h>
 
 /*
- * BiliDanmaku120 0.3.0 BFCTargetSafe
+ * BiliDanmaku120 0.3.1 ExactTickLayerProbe
  *
  * Findings from the device log:
  *   BFCDisplayLink              displayLinkDidRefresh:
@@ -38,13 +39,8 @@ static NSString *gLogPath = nil;
 static dispatch_queue_t gLogQueue;
 static const unsigned long long gMaxLogBytes = 128ULL * 1024ULL;
 static NSMutableSet<NSString *> *gDumpedClasses = nil;
-static NSMutableSet<NSString *> *gInstalledSpeedKeys = nil;
-static NSMutableDictionary<NSString *, NSNumber *> *gOrigDoubleIMPs = nil;
-static NSMutableDictionary<NSString *, NSNumber *> *gOrigFloatIMPs = nil;
 static volatile uint64_t gDmkTickCount = 0;
-static volatile uint64_t gSpeedCapCount = 0;
 static BOOL gTickHooked = NO;
-static void (*gOrigCommentTick)(id, SEL) = NULL;
 
 static NSInteger GTDMaxScreenFPS(void) {
     UIScreen *s = UIScreen.mainScreen;
@@ -146,147 +142,136 @@ static void GTDDumpExactClass(NSString *className) {
     GTDLog(@"CLASS %@ ivars=%@", className, ihits.count ? [ihits componentsJoinedByString:@", "] : @"(none)");
 }
 
-#pragma mark - Exact BFC comment tick counter
+#pragma mark - Exact BFC callback counter + safe CRON layer probe
 
-static BOOL GTDVoidNoArgMethod(Method m) {
-    if (!m || method_getNumberOfArguments(m) != 2) return NO;
+// We hook ONE exact callback only, in priority order. This avoids double-counting
+// when BFCCRONRenderViewV2 owns more than one CADisplayLink.
+static NSString *gTickSource = nil;
+static void (*gOrigTickNoArg)(id, SEL) = NULL;
+static void (*gOrigTickOneObj)(id, SEL, id) = NULL;
+static volatile uint64_t gLayerSpeedClampCount = 0;
+
+static BOOL GTDMethodReturnsVoid(Method m) {
+    if (!m) return NO;
     char ret[16] = {0};
     method_getReturnType(m, ret, sizeof(ret));
     return ret[0] == 'v';
 }
 
-static void GTDCommentTickHook(id self, SEL _cmd) {
+static BOOL GTDMethodOneObjectArg(Method m) {
+    if (!m || method_getNumberOfArguments(m) != 3 || !GTDMethodReturnsVoid(m)) return NO;
+    char arg[64] = {0};
+    method_getArgumentType(m, 2, arg, sizeof(arg));
+    return arg[0] == '@';
+}
+
+static BOOL GTDMethodNoExplicitArg(Method m) {
+    return m && method_getNumberOfArguments(m) == 2 && GTDMethodReturnsVoid(m);
+}
+
+static CALayer *GTDLayerForRenderObject(id obj) {
+    if (!obj) return nil;
+    if ([obj isKindOfClass:[UIView class]]) return ((UIView *)obj).layer;
+    SEL layerSel = NSSelectorFromString(@"layer");
+    if ([obj respondsToSelector:layerSel]) {
+        id layer = ((id(*)(id,SEL))objc_msgSend)(obj, layerSel);
+        if ([layer isKindOfClass:[CALayer class]]) return (CALayer *)layer;
+    }
+    return nil;
+}
+
+static void GTDNormalizeCRONLayerSpeed(id self) {
+    if (![NSStringFromClass([self class]) isEqualToString:@"BFCCRONRenderViewV2"]) return;
+    CALayer *layer = GTDLayerForRenderObject(self);
+    if (!layer) return;
+    float speed = layer.speed;
+    if (!(speed > 1.001f && speed <= 4.001f)) return;
+
+    // Preserve the layer's local time while returning its animation clock to 1x.
+    // If Bilibili drives comment motion manually from media time, this will have
+    // no effect; it is intentionally limited to this exact comment render view.
+    CFTimeInterval now = CACurrentMediaTime();
+    CFTimeInterval localBefore = [layer convertTime:now fromLayer:nil];
+    layer.speed = 1.0f;
+    layer.timeOffset = 0.0;
+    layer.beginTime = 0.0;
+    CFTimeInterval localAfter = [layer convertTime:now fromLayer:nil];
+    layer.beginTime = localAfter - localBefore;
+
+    uint64_t n = __sync_add_and_fetch(&gLayerSpeedClampCount, 1);
+    if (n <= 12) GTDLog(@"LAYER SPEED CAP class=BFCCRONRenderViewV2 %.3f -> 1.000", speed);
+}
+
+static void GTDTickNoArgHook(id self, SEL _cmd) {
     __sync_fetch_and_add(&gDmkTickCount, 1);
-    if (gOrigCommentTick) gOrigCommentTick(self, _cmd);
+    GTDNormalizeCRONLayerSpeed(self);
+    if (gOrigTickNoArg) gOrigTickNoArg(self, _cmd);
+}
+
+static void GTDTickOneObjHook(id self, SEL _cmd, id sender) {
+    __sync_fetch_and_add(&gDmkTickCount, 1);
+    GTDNormalizeCRONLayerSpeed(self);
+    if (gOrigTickOneObj) gOrigTickOneObj(self, _cmd, sender);
+}
+
+static BOOL GTDTryHookTickCandidate(NSString *className, NSString *selectorName) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return NO;
+    SEL sel = NSSelectorFromString(selectorName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+
+    NSString *enc = GTDMethodEncoding(m);
+    unsigned int argc = method_getNumberOfArguments(m);
+    GTDLog(@"TICK candidate %@::%@ encoding=%@ argc=%u", className, selectorName, enc, argc);
+
+    IMP orig = NULL;
+    if (GTDMethodNoExplicitArg(m)) {
+        MSHookMessageEx(cls, sel, (IMP)GTDTickNoArgHook, &orig);
+        if (orig) {
+            gOrigTickNoArg = (void(*)(id,SEL))orig;
+            gTickSource = [NSString stringWithFormat:@"%@::%@", className, selectorName];
+            gTickHooked = YES;
+            GTDLog(@"TICK hook OK source=%@ mode=noarg", gTickSource);
+            return YES;
+        }
+    } else if (GTDMethodOneObjectArg(m)) {
+        MSHookMessageEx(cls, sel, (IMP)GTDTickOneObjHook, &orig);
+        if (orig) {
+            gOrigTickOneObj = (void(*)(id,SEL,id))orig;
+            gTickSource = [NSString stringWithFormat:@"%@::%@", className, selectorName];
+            gTickHooked = YES;
+            GTDLog(@"TICK hook OK source=%@ mode=objectArg", gTickSource);
+            return YES;
+        }
+    }
+
+    GTDLog(@"TICK skip %@::%@ unsupported ABI encoding=%@", className, selectorName, enc);
+    return NO;
 }
 
 static void GTDTryInstallTickHook(void) {
     if (gTickHooked) return;
-    Class cls = NSClassFromString(@"BFCCommentFrameRateBooster");
-    if (!cls) return;
-    SEL sel = NSSelectorFromString(@"_displayLinkTick");
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        GTDLog(@"TICK BFCCommentFrameRateBooster has no _displayLinkTick");
-        gTickHooked = YES;
-        return;
-    }
-    if (!GTDVoidNoArgMethod(m)) {
-        GTDLog(@"TICK skipped encoding=%@ argc=%u", GTDMethodEncoding(m), method_getNumberOfArguments(m));
-        gTickHooked = YES;
-        return;
-    }
-    IMP orig = NULL;
-    MSHookMessageEx(cls, sel, (IMP)GTDCommentTickHook, &orig);
-    if (orig) {
-        gOrigCommentTick = (void(*)(id,SEL))orig;
-        gTickHooked = YES;
-        GTDLog(@"TICK hook OK class=BFCCommentFrameRateBooster sel=_displayLinkTick encoding=%@", GTDMethodEncoding(m));
-    }
+
+    // Prefer the actual CRON render view callback, because it is the best proxy
+    // for on-screen comment updates and also lets us inspect only its own layer.
+    if (GTDTryHookTickCandidate(@"BFCCRONRenderViewV2", @"mainOnDisplayLink:")) return;
+    if (GTDTryHookTickCandidate(@"BFCCRONRenderViewV2", @"onDisplayLink:")) return;
+    if (GTDTryHookTickCandidate(@"BFCCommentFrameRateBooster", @"_displayLinkTick")) return;
+    (void)GTDTryHookTickCandidate(@"BFCDisplayLink", @"displayLinkDidRefresh:");
 }
 
-#pragma mark - Exact, ABI-checked speed/rate setters
+#pragma mark - Exact class probe
 
-static NSString *GTDSpeedKey(Class cls, SEL sel) {
-    return [NSString stringWithFormat:@"%@::%@", NSStringFromClass(cls), NSStringFromSelector(sel)];
-}
-
-static uintptr_t GTDLookupOrig(NSMutableDictionary<NSString *, NSNumber *> *map, id self, SEL sel) {
-    Class c = object_getClass(self);
-    while (c) {
-        NSNumber *n = map[GTDSpeedKey(c, sel)];
-        if (n) return (uintptr_t)[n unsignedLongLongValue];
-        c = class_getSuperclass(c);
-    }
-    return (uintptr_t)0;
-}
-
-static double GTDClampSpeed(double requested, id self, SEL _cmd) {
-    if (requested > 1.001 && requested <= 4.001) {
-        uint64_t n = __sync_add_and_fetch(&gSpeedCapCount, 1);
-        if (n <= 12) {
-            GTDLog(@"SPEED CAP class=%@ sel=%@ %.3f -> 1.000", NSStringFromClass([self class]), NSStringFromSelector(_cmd), requested);
-        }
-        return 1.0;
-    }
-    return requested;
-}
-
-static void GTDHookDoubleSetter(id self, SEL _cmd, double requested) {
-    uintptr_t p = GTDLookupOrig(gOrigDoubleIMPs, self, _cmd);
-    if (!p) return;
-    double adjusted = GTDClampSpeed(requested, self, _cmd);
-    ((void(*)(id,SEL,double))(void *)p)(self, _cmd, adjusted);
-}
-
-static void GTDHookFloatSetter(id self, SEL _cmd, float requested) {
-    uintptr_t p = GTDLookupOrig(gOrigFloatIMPs, self, _cmd);
-    if (!p) return;
-    float adjusted = (float)GTDClampSpeed((double)requested, self, _cmd);
-    ((void(*)(id,SEL,float))(void *)p)(self, _cmd, adjusted);
-}
-
-static BOOL GTDSetterKind(Method m, char *kindOut) {
-    if (!m || method_getNumberOfArguments(m) != 3) return NO;
-    char ret[16] = {0};
-    char arg[32] = {0};
-    method_getReturnType(m, ret, sizeof(ret));
-    method_getArgumentType(m, 2, arg, sizeof(arg));
-    if (ret[0] != 'v') return NO;
-    if (arg[0] == 'd' || arg[0] == 'f') {
-        *kindOut = arg[0];
-        return YES;
-    }
-    return NO;
-}
-
-static void GTDTryInstallSpeedSetter(NSString *className, NSString *selectorName) {
-    Class cls = NSClassFromString(className);
-    if (!cls) return;
-    SEL sel = NSSelectorFromString(selectorName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-
-    NSString *key = GTDSpeedKey(cls, sel);
-    @synchronized (gInstalledSpeedKeys) {
-        if ([gInstalledSpeedKeys containsObject:key]) return;
-    }
-
-    char kind = 0;
-    if (!GTDSetterKind(m, &kind)) {
-        GTDLog(@"SPEED skip %@ encoding=%@", key, GTDMethodEncoding(m));
-        @synchronized (gInstalledSpeedKeys) { [gInstalledSpeedKeys addObject:key]; }
-        return;
-    }
-
-    IMP orig = NULL;
-    IMP replacement = (kind == 'd') ? (IMP)GTDHookDoubleSetter : (IMP)GTDHookFloatSetter;
-    MSHookMessageEx(cls, sel, replacement, &orig);
-    if (!orig) {
-        GTDLog(@"SPEED hook failed %@", key);
-        return;
-    }
-
-    NSNumber *boxed = [NSNumber numberWithUnsignedLongLong:(unsigned long long)(uintptr_t)orig];
-    if (kind == 'd') gOrigDoubleIMPs[key] = boxed;
-    else gOrigFloatIMPs[key] = boxed;
-    @synchronized (gInstalledSpeedKeys) { [gInstalledSpeedKeys addObject:key]; }
-    GTDLog(@"SPEED hook OK %@ kind=%c encoding=%@", key, kind, GTDMethodEncoding(m));
-}
-
-static void GTDTryInstallExactSpeedHooks(void) {
-    NSArray<NSString *> *classes = @[@"BFCCRONRenderViewV2", @"BFCCommentFrameRateBooster"];
-    NSArray<NSString *> *sels = @[@"setPlaybackRate:", @"setSpeed:", @"setRate:", @"setTimeScale:", @"setTimeRate:"];
-    for (NSString *cls in classes) {
-        for (NSString *sel in sels) GTDTryInstallSpeedSetter(cls, sel);
-    }
-}
+// 0.3.0's generic speed/rate setter guesses did not affect this Bilibili build.
+// 0.3.1 intentionally removes those hooks. We keep a one-time structural dump
+// of the exact BFC classes so the next iteration can target the real media-time
+// coupling instead of guessing more setter names.
 
 static void GTDProbeExactClasses(void) {
     NSArray<NSString *> *classes = @[@"BFCDisplayLink", @"BFCCRONRenderViewV2", @"BFCCommentFrameRateBooster"];
     for (NSString *name in classes) GTDDumpExactClass(name);
     GTDTryInstallTickHook();
-    GTDTryInstallExactSpeedHooks();
 }
 
 #pragma mark - DMK overlay
@@ -411,13 +396,10 @@ static void GTDProbeExactClasses(void) {
 
         gLogQueue = dispatch_queue_create("com.chatgpt.bilidanmaku120.log", DISPATCH_QUEUE_SERIAL);
         gDumpedClasses = [NSMutableSet set];
-        gInstalledSpeedKeys = [NSMutableSet set];
-        gOrigDoubleIMPs = [NSMutableDictionary dictionary];
-        gOrigFloatIMPs = [NSMutableDictionary dictionary];
         NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
         [NSFileManager.defaultManager createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
         gLogPath = [docs stringByAppendingPathComponent:@"BiliDanmaku120.log"];
-        GTDLog(@"BiliDanmaku120 0.3.0 START maxScreen=%ld globalCADisplayLinkHook=NO", (long)GTDMaxScreenFPS());
+        GTDLog(@"BiliDanmaku120 0.3.1 START maxScreen=%ld globalCADisplayLinkHook=NO", (long)GTDMaxScreenFPS());
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [[GTDOverlay shared] start];

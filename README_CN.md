@@ -1,35 +1,54 @@
-# BiliDanmaku120 0.3.0 — BFCTargetSafe
+# BiliDanmaku120 0.3.1 — ExactTickLayerProbe
 
-根据设备日志重新设计，不再猜测 `danmaku/barrage` 类名。
+这一版针对当前实测结果：
 
-日志已经明确看到 B站自己的：
+- BiliVideoFPS120 的 VID 已恢复正常
+- 0.3.0/0.2.2 的通用 `speed/rate` setter 猜测没有让 2x/3x 弹幕减速
+- `DMK --/120` 说明上一版的 tick ABI 判断没有命中
 
-- `BFCDisplayLink -displayLinkDidRefresh:`
-- `BFCCRONRenderViewV2 -onDisplayLink:` / `-mainOnDisplayLink:`
-- `BFCCommentFrameRateBooster -_displayLinkTick`
+## 0.3.1 改动
 
-## 为什么 0.2.2 会让 VID 变成 --
+### 1. 修复 DMK 统计路线
 
-0.2.2 仍然全局 Hook 了 `CADisplayLink` 的创建、`setPreferredFramesPerSecond:` 和 `setFrameInterval:`。而 BiliVideoFPS120 本身也 Hook `CADisplayLink`。两个 tweak 同时改系统同一类的链路没有必要，也增加了 Hook 顺序冲突的风险。
+不再只认 `BFCCommentFrameRateBooster -_displayLinkTick` 的无参数形式。按优先级只 Hook **一个**真实回调：
 
-0.3.0 **完全不 Hook CADisplayLink**。120Hz 的 60->120 提升继续交给 BiliVideoFPS120；本 tweak 只处理弹幕自己的 BFC 类。
+1. `BFCCRONRenderViewV2 -mainOnDisplayLink:`
+2. `BFCCRONRenderViewV2 -onDisplayLink:`
+3. `BFCCommentFrameRateBooster -_displayLinkTick`
+4. `BFCDisplayLink -displayLinkDidRefresh:`
 
-## 这一版做什么
+支持经过运行时验证的两种 ABI：
 
-1. 只在 ABI 严格匹配时 Hook `BFCCommentFrameRateBooster -_displayLinkTick`，统计真实弹幕更新频率，显示 `DMK xx/120`。
-2. 只检查 `BFCCRONRenderViewV2` 和 `BFCCommentFrameRateBooster` 两个准确类。
-3. 如果它们存在以下 setter，且签名是安全的 `void(float)` / `void(double)`，才把 `>1x && <=4x` 压回 1x：
-   - `setPlaybackRate:`
-   - `setSpeed:`
-   - `setRate:`
-   - `setTimeScale:`
-   - `setTimeRate:`
-4. 不扫描整个 Objective-C runtime，不碰 IJK，不碰 renderer `display_pixels:`，因此不会和 VID 计数链直接冲突。
-5. 日志最大约 128KB，并且只记录类结构和少量 speed cap 事件，不会持续刷大。
+- `void()`
+- `void(id)`
 
-## 如果弹幕仍随视频 2x/3x
+只选一个回调，避免同一帧被重复计数。
 
-这意味着 B站弹幕不是通过上述 speed/rate setter 加速，而是直接使用“视频媒体时间”计算位置。把新的 `Documents/BiliDanmaku120.log` 发回来；本版会记录上述三个 BFC 类中与 `time/rate/speed/clock/progress/position/render` 有关的方法、property 和 ivar，下一版可以精确解耦弹幕时钟。
+### 2. 仍然不碰全局 CADisplayLink
+
+120Hz 提升继续交给 BiliVideoFPS120。这个插件不 Hook 系统 `CADisplayLink`，也不碰 IJK / `display_pixels:`，避免再次导致 VID 变成 `--`。
+
+### 3. 弹幕减速：只做一个低风险 layer-speed 实验
+
+如果 `BFCCRONRenderViewV2` 自己的 `CALayer.speed` 被 B站设成 2/3，0.3.1 会在其精确 display-link callback 中把它恢复成 1.0，并尽量保持当前 layer local time 连续。
+
+如果 B站实际上是根据“视频媒体时间”手工计算弹幕位置，那么这一项不会生效；这时不会继续猜 setter。
+
+### 4. 为真正的独立弹幕时钟准备日志
+
+仍会一次性记录以下准确类中与 `time / clock / progress / position / rate / render / frame` 有关的方法、property、ivar：
+
+- `BFCDisplayLink`
+- `BFCCRONRenderViewV2`
+- `BFCCommentFrameRateBooster`
+
+日志上限约 128KB，不持续刷 FPS。
+
+## 预期
+
+首先验证 `DMK` 是否由 `--/120` 变成实际数字。
+
+如果 2x/3x 下弹幕仍然跟随视频变快，请发送新版 `Documents/BiliDanmaku120.log`。下一版将根据真实 time/clock 接口做“出现时机跟视频、横向运动按 1x wall-clock”的独立时钟。
 
 ## 编译
 
