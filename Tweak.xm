@@ -37,7 +37,7 @@ static NSString *gLogPath = nil;
 static dispatch_queue_t gLogQueue;
 static NSMutableSet<NSString *> *gSeenLinks = nil;
 static NSHashTable *gCandidateProxies = nil;
-static NSMutableDictionary<NSString *, NSValue *> *gSpeedOrigIMPs = nil;
+static NSMutableDictionary<NSString *, NSNumber *> *gSpeedOrigIMPs = nil;
 static NSMutableSet<NSString *> *gInstalledSpeedHooks = nil;
 static const void *kGTDMetaKey = &kGTDMetaKey;
 static const void *kGTDProxyKey = &kGTDProxyKey;
@@ -123,6 +123,7 @@ static BOOL GTDLooksLikeDanmaku(id target, SEL selector) {
 @property(nonatomic, assign) CFTimeInterval lastTime;
 @property(nonatomic, assign) double smoothedFPS;
 - (void)gt_fire:(CADisplayLink *)link;
+- (uint64_t)gt_atomicFrameCount;
 @end
 
 @implementation GTDDisplayLinkProxy
@@ -132,6 +133,10 @@ static BOOL GTDLooksLikeDanmaku(id target, SEL selector) {
     SEL s = self.originalSelector;
     if (!t || !s || ![t respondsToSelector:s]) return;
     ((void(*)(id, SEL, id))objc_msgSend)(t, s, link);
+}
+
+- (uint64_t)gt_atomicFrameCount {
+    return __sync_fetch_and_add(&_frameCount, 0);
 }
 @end
 
@@ -155,9 +160,9 @@ static IMP GTDOriginalScalarIMPForObject(id obj, SEL sel) {
     // the hooked implementation may live on a parent class.
     while (cls) {
         NSString *key = GTDHookKey(cls, sel);
-        NSValue *v = nil;
+        NSNumber *v = nil;
         @synchronized (gSpeedOrigIMPs) { v = gSpeedOrigIMPs[key]; }
-        if (v) return (IMP)[v pointerValue];
+        if (v) return (IMP)(uintptr_t)[v unsignedLongLongValue];
         cls = class_getSuperclass(cls);
     }
     return NULL;
@@ -228,7 +233,7 @@ static void GTDInstallSpeedHookOnClass(Class cls, SEL sel) {
     MSHookMessageEx(cls, sel, (IMP)GTDHookedSetScalar, &orig);
     if (orig) {
         @synchronized (gSpeedOrigIMPs) {
-            gSpeedOrigIMPs[key] = [NSValue valueWithPointer:orig];
+            gSpeedOrigIMPs[key] = @((unsigned long long)(uintptr_t)orig);
         }
         GTDLog(@"SPEED HOOK OK class=%@ selector=%@ encoding=%s",
                NSStringFromClass(cls), NSStringFromSelector(sel), method_getTypeEncoding(m));
@@ -496,7 +501,7 @@ static void GTDInstallDisplayLinkHooks(void) {
     NSString *bestName = nil;
 
     for (GTDDisplayLinkProxy *p in proxies) {
-        uint64_t count = __sync_fetch_and_add(&p->_frameCount, 0);
+        uint64_t count = [p gt_atomicFrameCount];
         if (p.lastTime > 0.0 && now > p.lastTime && count >= p.lastCount) {
             double dt = now - p.lastTime;
             uint64_t delta = count - p.lastCount;

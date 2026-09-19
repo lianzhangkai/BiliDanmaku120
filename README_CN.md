@@ -1,4 +1,4 @@
-# BiliDanmaku120 0.2.0 — NormalSpeed120
+# BiliDanmaku120 0.2.1 — NormalSpeed120
 
 目标已经从“弹幕跟着视频倍速跑”改成：
 
@@ -69,3 +69,13 @@ make clean package FINALPACKAGE=1 messages=yes
 - arm64 + old-ABI arm64e
 - Odyssey / libhooker
 - Theos + iOS 13.7 SDK
+
+
+## 0.2.1 编译修正
+
+针对 iOS 13.7 SDK + 旧 clang/Werror 修复两处：
+
+- 不再直接把函数指针 `IMP` 传给 `NSValue valueWithPointer:`，改为通过 `uintptr_t`/`NSNumber` 保存和恢复
+- 不再从外部直接访问 `GTDDisplayLinkProxy` 的私有 ivar `_frameCount`，改为类内原子 getter
+
+功能逻辑与 0.2.0 保持一致。
