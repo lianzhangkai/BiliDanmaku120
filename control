@@ -1,8 +1,8 @@
 Package: com.chatgpt.bilidanmaku120
 Name: BiliDanmaku120
-Version: 0.2.2
+Version: 0.3.0
 Architecture: iphoneos-arm
-Description: Safe Bilibili iOS 13 danmaku 120Hz probe with exact-name speed hooks only. Does not replace CADisplayLink targets and does not scan/hook arbitrary runtime classes.
+Description: Targeted Bilibili iOS 13 danmaku probe/control for BFC comment renderer classes. Does not hook CADisplayLink globally; counts BFCCommentFrameRateBooster ticks and safely clamps only exact danmaku speed/rate setters when their ABI is verified.
 Maintainer: ChatGPT
 Author: ChatGPT
 Section: Tweaks

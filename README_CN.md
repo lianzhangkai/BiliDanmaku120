@@ -1,47 +1,38 @@
-# BiliDanmaku120 0.2.2 — SafeExactSpeed
+# BiliDanmaku120 0.3.0 — BFCTargetSafe
 
-这是针对 0.2.1 启动闪退的安全重构版。
+根据设备日志重新设计，不再猜测 `danmaku/barrage` 类名。
 
-## 0.2.1 为什么风险高
+日志已经明确看到 B站自己的：
 
-0.2.1 同时做了两件比较激进的事：
+- `BFCDisplayLink -displayLinkDidRefresh:`
+- `BFCCRONRenderViewV2 -onDisplayLink:` / `-mainOnDisplayLink:`
+- `BFCCommentFrameRateBooster -_displayLinkTick`
 
-1. 把疑似弹幕 `CADisplayLink` 的原始 target 替换成 proxy，再转发 callback
-2. 扫描整个 Objective-C runtime，并对名字像 danmaku/danmu/barrage/bullet 的类动态安装 speed/rate hook
+## 为什么 0.2.2 会让 VID 变成 --
 
-这两部分都可能碰到 B站自己的私有实现，因此 0.2.2 全部移除。
+0.2.2 仍然全局 Hook 了 `CADisplayLink` 的创建、`setPreferredFramesPerSecond:` 和 `setFrameInterval:`。而 BiliVideoFPS120 本身也 Hook `CADisplayLink`。两个 tweak 同时改系统同一类的链路没有必要，也增加了 Hook 顺序冲突的风险。
 
-## 0.2.2 做什么
+0.3.0 **完全不 Hook CADisplayLink**。120Hz 的 60->120 提升继续交给 BiliVideoFPS120；本 tweak 只处理弹幕自己的 BFC 类。
 
-- 不替换 `CADisplayLink` target/selector
-- 不扫描并 hook 任意 B站类
-- 只识别疑似弹幕 `CADisplayLink`，请求 120Hz
-- 只对精确类名 `BarrageClock` / `BarrageRenderer` 的 `setSpeed:` 尝试 hook
-- hook 前必须确认签名是 arm64 下安全的 `void(double)`
-- 如果 B站不用这两个类，则只记录真实弹幕类和方法，不强行修改速度
+## 这一版做什么
 
-目标仍然是：视频可以 2x/3x，弹幕尽量保持 1x，同时请求 120Hz。
+1. 只在 ABI 严格匹配时 Hook `BFCCommentFrameRateBooster -_displayLinkTick`，统计真实弹幕更新频率，显示 `DMK xx/120`。
+2. 只检查 `BFCCRONRenderViewV2` 和 `BFCCommentFrameRateBooster` 两个准确类。
+3. 如果它们存在以下 setter，且签名是安全的 `void(float)` / `void(double)`，才把 `>1x && <=4x` 压回 1x：
+   - `setPlaybackRate:`
+   - `setSpeed:`
+   - `setRate:`
+   - `setTimeScale:`
+   - `setTimeRate:`
+4. 不扫描整个 Objective-C runtime，不碰 IJK，不碰 renderer `display_pixels:`，因此不会和 VID 计数链直接冲突。
+5. 日志最大约 128KB，并且只记录类结构和少量 speed cap 事件，不会持续刷大。
 
-## 日志
+## 如果弹幕仍随视频 2x/3x
 
-路径：
-
-`Bilibili 数据容器/Documents/BiliDanmaku120.log`
-
-重点看：
-
-- `DMK MATCH target=... selector=...`
-- `DMK CLASS ... methods=...`
-- `EXACT BarrageClock setSpeed: hook OK`
-- `EXACT BarrageRenderer setSpeed: hook OK`
-- `SPEED CAP ... 2.000 -> 1.000`
-
-如果弹幕仍随视频 2x/3x 加速，把日志发回来。下一版就只针对日志中出现的真实类/selector 做 hook。
+这意味着 B站弹幕不是通过上述 speed/rate setter 加速，而是直接使用“视频媒体时间”计算位置。把新的 `Documents/BiliDanmaku120.log` 发回来；本版会记录上述三个 BFC 类中与 `time/rate/speed/clock/progress/position/render` 有关的方法、property 和 ivar，下一版可以精确解耦弹幕时钟。
 
 ## 编译
 
 ```bash
 make clean package FINALPACKAGE=1 messages=yes
 ```
-
-目标：iPadOS 13.7 / arm64 + old-ABI arm64e / Odyssey + libhooker。

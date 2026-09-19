@@ -3,40 +3,53 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#include <stdint.h>
 
 /*
- * BiliDanmaku120 0.2.2 SafeExactSpeed
+ * BiliDanmaku120 0.3.0 BFCTargetSafe
  *
- * Safety changes after the 0.2.1 launch crash:
- *  - NEVER replace CADisplayLink's original target with a proxy.
- *  - NEVER scan all Objective-C classes and hook arbitrary speed/rate methods.
- *  - Only hook exact, well-known BarrageRenderer/BarrageClock setSpeed: methods,
- *    and only after verifying a void(double) signature on arm64/old-arm64e.
- *  - Candidate danmaku CADisplayLinks keep their original target/selector.
+ * Findings from the device log:
+ *   BFCDisplayLink              displayLinkDidRefresh:
+ *   BFCCRONRenderViewV2        onDisplayLink: / mainOnDisplayLink:
+ *   BFCCommentFrameRateBooster _displayLinkTick
  *
- * Goal remains:
- *  - Request up to 120Hz for likely danmaku display links.
- *  - If Bilibili uses the common BarrageRenderer/BarrageClock engine, clamp
- *    danmaku clock speed >1x back to 1x while video can remain 2x/3x.
- *  - If it uses a different engine, log the exact class and interesting methods
- *    for a later targeted build instead of guessing and risking another crash.
+ * Design:
+ * - DO NOT hook CADisplayLink at all. BiliVideoFPS120 remains the sole owner of
+ *   the global 60->120 DisplayLink lift, avoiding the 0.2.2 conflict that made
+ *   VID disappear.
+ * - Hook only the exact BFCCommentFrameRateBooster _displayLinkTick method when
+ *   its ABI is verified as void/no-explicit-argument, and count real comment
+ *   update ticks for the DMK overlay.
+ * - Inspect only two exact Bilibili comment classes for likely speed/rate
+ *   setters. If a whitelisted setter exists and is ABI-safe void(float/double),
+ *   clamp requests in (1x, 4x] back to 1x. No broad runtime scanning.
+ * - Dump interesting methods/properties/ivars once into a bounded log so the
+ *   next build can target the real media-time coupling if Bilibili does not use
+ *   one of the common setters.
  */
+
+@interface GTDPassWindow : UIWindow @end
+@implementation GTDPassWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event { (void)point; (void)event; return nil; }
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event { (void)point; (void)event; return NO; }
+@end
 
 static NSString *gLogPath = nil;
 static dispatch_queue_t gLogQueue;
-static NSMutableSet<NSString *> *gSeenLinks = nil;
+static const unsigned long long gMaxLogBytes = 128ULL * 1024ULL;
 static NSMutableSet<NSString *> *gDumpedClasses = nil;
-static const void *kGTDCandidateKey = &kGTDCandidateKey;
-static volatile uint64_t gExactSpeedCaps = 0;
+static NSMutableSet<NSString *> *gInstalledSpeedKeys = nil;
+static NSMutableDictionary<NSString *, NSNumber *> *gOrigDoubleIMPs = nil;
+static NSMutableDictionary<NSString *, NSNumber *> *gOrigFloatIMPs = nil;
+static volatile uint64_t gDmkTickCount = 0;
+static volatile uint64_t gSpeedCapCount = 0;
+static BOOL gTickHooked = NO;
+static void (*gOrigCommentTick)(id, SEL) = NULL;
 
 static NSInteger GTDMaxScreenFPS(void) {
     UIScreen *s = UIScreen.mainScreen;
     if ([s respondsToSelector:@selector(maximumFramesPerSecond)]) return s.maximumFramesPerSecond;
     return 60;
-}
-
-static BOOL GTDIs120Hz(void) {
-    return GTDMaxScreenFPS() >= 120;
 }
 
 static void GTDLog(NSString *format, ...) {
@@ -50,6 +63,13 @@ static void GTDLog(NSString *format, ...) {
             NSString *line = [NSString stringWithFormat:@"%.3f %@\n", NSDate.date.timeIntervalSince1970, msg];
             NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
             NSFileManager *fm = NSFileManager.defaultManager;
+            NSDictionary *attrs = [fm attributesOfItemAtPath:gLogPath error:nil];
+            unsigned long long size = attrs ? [[attrs objectForKey:NSFileSize] unsignedLongLongValue] : 0;
+            if (size >= gMaxLogBytes) {
+                [fm removeItemAtPath:gLogPath error:nil];
+                NSString *reset = [NSString stringWithFormat:@"%.3f LOG RESET oldSize=%llu max=%llu\n", NSDate.date.timeIntervalSince1970, size, gMaxLogBytes];
+                [[reset dataUsingEncoding:NSUTF8StringEncoding] writeToFile:gLogPath atomically:YES];
+            }
             if (![fm fileExistsAtPath:gLogPath]) {
                 [data writeToFile:gLogPath atomically:YES];
             } else {
@@ -64,238 +84,348 @@ static void GTDLog(NSString *format, ...) {
     });
 }
 
-static BOOL GTDContainsAny(NSString *text, NSArray<NSString *> *terms) {
-    if (text.length == 0) return NO;
-    NSString *low = text.lowercaseString;
-    for (NSString *term in terms) {
-        if ([low containsString:term]) return YES;
-    }
+static BOOL GTDNameContainsAny(NSString *name, NSArray<NSString *> *terms) {
+    if (name.length == 0) return NO;
+    NSString *low = name.lowercaseString;
+    for (NSString *term in terms) if ([low containsString:term]) return YES;
     return NO;
 }
 
-static NSArray<NSString *> *GTDStrongTerms(void) {
-    static NSArray<NSString *> *terms = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        terms = @[@"danmaku", @"danmu", @"barrage", @"bullet"];
-    });
-    return terms;
+static NSString *GTDMethodEncoding(Method m) {
+    const char *enc = m ? method_getTypeEncoding(m) : NULL;
+    return enc ? [NSString stringWithUTF8String:enc] : @"?";
 }
 
-static BOOL GTDLooksLikeDanmakuTarget(id target, SEL selector) {
-    NSString *cls = target ? NSStringFromClass([target class]) : @"";
-    NSString *sel = selector ? NSStringFromSelector(selector) : @"";
-    if ([cls isEqualToString:@"BarrageClock"] || [cls isEqualToString:@"BarrageRenderer"]) return YES;
-    return GTDContainsAny(cls, GTDStrongTerms()) || GTDContainsAny(sel, GTDStrongTerms());
-}
-
-static void GTDDumpInterestingMethods(Class cls) {
+static void GTDDumpExactClass(NSString *className) {
+    Class cls = NSClassFromString(className);
     if (!cls) return;
-    NSString *className = NSStringFromClass(cls) ?: @"?";
     @synchronized (gDumpedClasses) {
         if ([gDumpedClasses containsObject:className]) return;
         [gDumpedClasses addObject:className];
     }
 
-    NSArray<NSString *> *terms = @[@"speed", @"rate", @"time", @"clock", @"update", @"tick", @"display", @"render", @"move", @"duration"];
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList(cls, &count);
-    NSMutableArray<NSString *> *hits = [NSMutableArray array];
-    for (unsigned int i = 0; i < count; i++) {
+    NSArray<NSString *> *terms = @[@"speed", @"rate", @"time", @"clock", @"tick", @"display", @"render", @"comment", @"danmaku", @"duration", @"progress", @"position", @"frame"];
+
+    unsigned int mc = 0;
+    Method *methods = class_copyMethodList(cls, &mc);
+    NSMutableArray<NSString *> *mhits = [NSMutableArray array];
+    for (unsigned int i = 0; i < mc; i++) {
         SEL sel = method_getName(methods[i]);
-        NSString *name = NSStringFromSelector(sel);
-        if (GTDContainsAny(name, terms)) {
-            const char *enc = method_getTypeEncoding(methods[i]);
-            [hits addObject:[NSString stringWithFormat:@"%@ <%s>", name, enc ?: "?"]];
+        NSString *name = NSStringFromSelector(sel) ?: @"";
+        if (GTDNameContainsAny(name, terms)) {
+            [mhits addObject:[NSString stringWithFormat:@"%@<%@>", name, GTDMethodEncoding(methods[i])]];
         }
     }
-    free(methods);
-    GTDLog(@"DMK CLASS %@ methods=%@", className, hits.count ? [hits componentsJoinedByString:@", "] : @"(none)");
+    if (methods) free(methods);
+
+    unsigned int pc = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &pc);
+    NSMutableArray<NSString *> *phits = [NSMutableArray array];
+    for (unsigned int i = 0; i < pc; i++) {
+        const char *n = property_getName(props[i]);
+        NSString *name = n ? [NSString stringWithUTF8String:n] : @"";
+        if (GTDNameContainsAny(name, terms)) [phits addObject:name];
+    }
+    if (props) free(props);
+
+    unsigned int ic = 0;
+    Ivar *ivars = class_copyIvarList(cls, &ic);
+    NSMutableArray<NSString *> *ihits = [NSMutableArray array];
+    for (unsigned int i = 0; i < ic; i++) {
+        const char *n = ivar_getName(ivars[i]);
+        const char *t = ivar_getTypeEncoding(ivars[i]);
+        NSString *name = n ? [NSString stringWithUTF8String:n] : @"";
+        if (GTDNameContainsAny(name, terms)) {
+            [ihits addObject:[NSString stringWithFormat:@"%@<%s>", name, t ?: "?"]];
+        }
+    }
+    if (ivars) free(ivars);
+
+    GTDLog(@"CLASS %@ methods=%@", className, mhits.count ? [mhits componentsJoinedByString:@", "] : @"(none)");
+    GTDLog(@"CLASS %@ props=%@", className, phits.count ? [phits componentsJoinedByString:@", "] : @"(none)");
+    GTDLog(@"CLASS %@ ivars=%@", className, ihits.count ? [ihits componentsJoinedByString:@", "] : @"(none)");
 }
 
-static BOOL GTDIsVoidDoubleSetter(Method m) {
-    if (!m || method_getNumberOfArguments(m) != 3) return NO;
+#pragma mark - Exact BFC comment tick counter
+
+static BOOL GTDVoidNoArgMethod(Method m) {
+    if (!m || method_getNumberOfArguments(m) != 2) return NO;
     char ret[16] = {0};
-    char arg[32] = {0};
     method_getReturnType(m, ret, sizeof(ret));
-    method_getArgumentType(m, 2, arg, sizeof(arg));
-    return ret[0] == 'v' && arg[0] == 'd';
+    return ret[0] == 'v';
 }
 
-typedef void (*GTDSetCGFloatIMP)(id, SEL, CGFloat);
-static GTDSetCGFloatIMP origBarrageClockSetSpeed = NULL;
-static GTDSetCGFloatIMP origBarrageRendererSetSpeed = NULL;
-static BOOL gBarrageClockHooked = NO;
-static BOOL gBarrageRendererHooked = NO;
+static void GTDCommentTickHook(id self, SEL _cmd) {
+    __sync_fetch_and_add(&gDmkTickCount, 1);
+    if (gOrigCommentTick) gOrigCommentTick(self, _cmd);
+}
 
-static CGFloat GTDClampDanmakuSpeed(CGFloat requested, NSString *owner) {
+static void GTDTryInstallTickHook(void) {
+    if (gTickHooked) return;
+    Class cls = NSClassFromString(@"BFCCommentFrameRateBooster");
+    if (!cls) return;
+    SEL sel = NSSelectorFromString(@"_displayLinkTick");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        GTDLog(@"TICK BFCCommentFrameRateBooster has no _displayLinkTick");
+        gTickHooked = YES;
+        return;
+    }
+    if (!GTDVoidNoArgMethod(m)) {
+        GTDLog(@"TICK skipped encoding=%@ argc=%u", GTDMethodEncoding(m), method_getNumberOfArguments(m));
+        gTickHooked = YES;
+        return;
+    }
+    IMP orig = NULL;
+    MSHookMessageEx(cls, sel, (IMP)GTDCommentTickHook, &orig);
+    if (orig) {
+        gOrigCommentTick = (void(*)(id,SEL))orig;
+        gTickHooked = YES;
+        GTDLog(@"TICK hook OK class=BFCCommentFrameRateBooster sel=_displayLinkTick encoding=%@", GTDMethodEncoding(m));
+    }
+}
+
+#pragma mark - Exact, ABI-checked speed/rate setters
+
+static NSString *GTDSpeedKey(Class cls, SEL sel) {
+    return [NSString stringWithFormat:@"%@::%@", NSStringFromClass(cls), NSStringFromSelector(sel)];
+}
+
+static uintptr_t GTDLookupOrig(NSMutableDictionary<NSString *, NSNumber *> *map, id self, SEL sel) {
+    Class c = object_getClass(self);
+    while (c) {
+        NSNumber *n = map[GTDSpeedKey(c, sel)];
+        if (n) return (uintptr_t)[n unsignedLongLongValue];
+        c = class_getSuperclass(c);
+    }
+    return (uintptr_t)0;
+}
+
+static double GTDClampSpeed(double requested, id self, SEL _cmd) {
     if (requested > 1.001 && requested <= 4.001) {
-        __sync_fetch_and_add(&gExactSpeedCaps, 1);
-        GTDLog(@"SPEED CAP %@ %.3f -> 1.000", owner, (double)requested);
+        uint64_t n = __sync_add_and_fetch(&gSpeedCapCount, 1);
+        if (n <= 12) {
+            GTDLog(@"SPEED CAP class=%@ sel=%@ %.3f -> 1.000", NSStringFromClass([self class]), NSStringFromSelector(_cmd), requested);
+        }
         return 1.0;
     }
     return requested;
 }
 
-static void hookBarrageClockSetSpeed(id self, SEL _cmd, CGFloat requested) {
-    CGFloat adjusted = GTDClampDanmakuSpeed(requested, @"BarrageClock");
-    if (origBarrageClockSetSpeed) origBarrageClockSetSpeed(self, _cmd, adjusted);
+static void GTDHookDoubleSetter(id self, SEL _cmd, double requested) {
+    uintptr_t p = GTDLookupOrig(gOrigDoubleIMPs, self, _cmd);
+    if (!p) return;
+    double adjusted = GTDClampSpeed(requested, self, _cmd);
+    ((void(*)(id,SEL,double))(void *)p)(self, _cmd, adjusted);
 }
 
-static void hookBarrageRendererSetSpeed(id self, SEL _cmd, CGFloat requested) {
-    CGFloat adjusted = GTDClampDanmakuSpeed(requested, @"BarrageRenderer");
-    if (origBarrageRendererSetSpeed) origBarrageRendererSetSpeed(self, _cmd, adjusted);
+static void GTDHookFloatSetter(id self, SEL _cmd, float requested) {
+    uintptr_t p = GTDLookupOrig(gOrigFloatIMPs, self, _cmd);
+    if (!p) return;
+    float adjusted = (float)GTDClampSpeed((double)requested, self, _cmd);
+    ((void(*)(id,SEL,float))(void *)p)(self, _cmd, adjusted);
 }
 
-static BOOL GTDInstallExactSpeedHook(NSString *className, IMP replacement, GTDSetCGFloatIMP *origStore, BOOL *installedFlag) {
-    if (*installedFlag) return YES;
-    Class cls = NSClassFromString(className);
-    if (!cls) return NO;
-
-    SEL sel = @selector(setSpeed:);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        GTDLog(@"EXACT %@ has no setSpeed:", className);
-        *installedFlag = YES; // no need to repeat forever
-        return NO;
+static BOOL GTDSetterKind(Method m, char *kindOut) {
+    if (!m || method_getNumberOfArguments(m) != 3) return NO;
+    char ret[16] = {0};
+    char arg[32] = {0};
+    method_getReturnType(m, ret, sizeof(ret));
+    method_getArgumentType(m, 2, arg, sizeof(arg));
+    if (ret[0] != 'v') return NO;
+    if (arg[0] == 'd' || arg[0] == 'f') {
+        *kindOut = arg[0];
+        return YES;
     }
-    if (!GTDIsVoidDoubleSetter(m)) {
-        GTDLog(@"EXACT %@ setSpeed: skipped encoding=%s", className, method_getTypeEncoding(m));
-        *installedFlag = YES;
-        return NO;
+    return NO;
+}
+
+static void GTDTryInstallSpeedSetter(NSString *className, NSString *selectorName) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return;
+    SEL sel = NSSelectorFromString(selectorName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+
+    NSString *key = GTDSpeedKey(cls, sel);
+    @synchronized (gInstalledSpeedKeys) {
+        if ([gInstalledSpeedKeys containsObject:key]) return;
+    }
+
+    char kind = 0;
+    if (!GTDSetterKind(m, &kind)) {
+        GTDLog(@"SPEED skip %@ encoding=%@", key, GTDMethodEncoding(m));
+        @synchronized (gInstalledSpeedKeys) { [gInstalledSpeedKeys addObject:key]; }
+        return;
     }
 
     IMP orig = NULL;
+    IMP replacement = (kind == 'd') ? (IMP)GTDHookDoubleSetter : (IMP)GTDHookFloatSetter;
     MSHookMessageEx(cls, sel, replacement, &orig);
     if (!orig) {
-        GTDLog(@"EXACT %@ setSpeed: hook failed", className);
-        return NO;
-    }
-    *origStore = (GTDSetCGFloatIMP)orig;
-    *installedFlag = YES;
-    GTDLog(@"EXACT %@ setSpeed: hook OK encoding=%s", className, method_getTypeEncoding(m));
-    return YES;
-}
-
-static void GTDTryExactSpeedHooks(void) {
-    GTDInstallExactSpeedHook(@"BarrageClock", (IMP)hookBarrageClockSetSpeed, &origBarrageClockSetSpeed, &gBarrageClockHooked);
-    GTDInstallExactSpeedHook(@"BarrageRenderer", (IMP)hookBarrageRendererSetSpeed, &origBarrageRendererSetSpeed, &gBarrageRendererHooked);
-}
-
-typedef CADisplayLink *(*GTDCreateDLIMP)(id, SEL, id, SEL);
-typedef void (*GTDSetFPSIMP)(id, SEL, NSInteger);
-typedef void (*GTDSetIntervalIMP)(id, SEL, NSInteger);
-static GTDCreateDLIMP origCreateDL = NULL;
-static GTDSetFPSIMP origSetPreferredFPS = NULL;
-static GTDSetIntervalIMP origSetFrameInterval = NULL;
-
-static CADisplayLink *hookCreateDisplayLink(id clsObj, SEL _cmd, id target, SEL selector) {
-    if (!origCreateDL) return nil;
-    CADisplayLink *link = origCreateDL(clsObj, _cmd, target, selector);
-    if (!link) return nil;
-
-    BOOL candidate = GTDLooksLikeDanmakuTarget(target, selector);
-    NSString *targetClass = target ? NSStringFromClass([target class]) : @"nil";
-    NSString *selectorName = selector ? NSStringFromSelector(selector) : @"nil";
-    NSString *key = [NSString stringWithFormat:@"%@::%@", targetClass, selectorName];
-
-    @synchronized (gSeenLinks) {
-        if (![gSeenLinks containsObject:key]) {
-            [gSeenLinks addObject:key];
-            GTDLog(@"DL CREATE target=%@ selector=%@ candidate=%d", targetClass, selectorName, candidate);
-        }
+        GTDLog(@"SPEED hook failed %@", key);
+        return;
     }
 
-    if (!candidate) return link;
+    NSNumber *boxed = [NSNumber numberWithUnsignedLongLong:(unsigned long long)(uintptr_t)orig];
+    if (kind == 'd') gOrigDoubleIMPs[key] = boxed;
+    else gOrigFloatIMPs[key] = boxed;
+    @synchronized (gInstalledSpeedKeys) { [gInstalledSpeedKeys addObject:key]; }
+    GTDLog(@"SPEED hook OK %@ kind=%c encoding=%@", key, kind, GTDMethodEncoding(m));
+}
 
-    objc_setAssociatedObject(link, kGTDCandidateKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    GTDDumpInterestingMethods([target class]);
-    GTDTryExactSpeedHooks();
+static void GTDTryInstallExactSpeedHooks(void) {
+    NSArray<NSString *> *classes = @[@"BFCCRONRenderViewV2", @"BFCCommentFrameRateBooster"];
+    NSArray<NSString *> *sels = @[@"setPlaybackRate:", @"setSpeed:", @"setRate:", @"setTimeScale:", @"setTimeRate:"];
+    for (NSString *cls in classes) {
+        for (NSString *sel in sels) GTDTryInstallSpeedSetter(cls, sel);
+    }
+}
 
-    if (GTDIs120Hz()) {
-        if (origSetPreferredFPS) origSetPreferredFPS(link, @selector(setPreferredFramesPerSecond:), 120);
-        else link.preferredFramesPerSecond = 120;
+static void GTDProbeExactClasses(void) {
+    NSArray<NSString *> *classes = @[@"BFCDisplayLink", @"BFCCRONRenderViewV2", @"BFCCommentFrameRateBooster"];
+    for (NSString *name in classes) GTDDumpExactClass(name);
+    GTDTryInstallTickHook();
+    GTDTryInstallExactSpeedHooks();
+}
+
+#pragma mark - DMK overlay
+
+@interface GTDOverlay : NSObject
+@property(nonatomic, strong) GTDPassWindow *window;
+@property(nonatomic, strong) UILabel *label;
+@property(nonatomic, strong) NSTimer *timer;
+@property(nonatomic, assign) uint64_t lastCount;
+@property(nonatomic, assign) CFTimeInterval lastTime;
+@property(nonatomic, assign) double smoothFPS;
++ (instancetype)shared;
+- (void)start;
+@end
+
+@implementation GTDOverlay
++ (instancetype)shared {
+    static GTDOverlay *o = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ o = [GTDOverlay new]; });
+    return o;
+}
+- (UIWindowScene *)foregroundScene API_AVAILABLE(ios(13.0)) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:UIWindowScene.class] &&
+            (scene.activationState == UISceneActivationStateForegroundActive || scene.activationState == UISceneActivationStateForegroundInactive)) return (UIWindowScene *)scene;
+    }
+    return nil;
+}
+- (CGRect)statusBarFrame {
+    CGRect f = CGRectZero;
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *s = self.window.windowScene ?: [self foregroundScene];
+        if (s.statusBarManager) f = s.statusBarManager.statusBarFrame;
+    }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        if ([link respondsToSelector:@selector(setFrameInterval:)]) {
-            if (origSetFrameInterval) origSetFrameInterval(link, @selector(setFrameInterval:), 1);
-            else link.frameInterval = 1;
+    if (CGRectIsEmpty(f)) f = UIApplication.sharedApplication.statusBarFrame;
+#pragma clang diagnostic pop
+    if (CGRectIsEmpty(f) || CGRectGetHeight(f) < 1.0) f = CGRectMake(0,0,CGRectGetWidth(UIScreen.mainScreen.bounds),20.0);
+    return f;
+}
+- (void)layout {
+    CGRect b = UIScreen.mainScreen.bounds;
+    self.window.frame = b;
+    CGRect sf = [self statusBarFrame];
+    CGFloat h = MIN(19.0, MAX(18.0, CGRectGetHeight(sf)));
+    CGSize fit = [self.label sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
+    CGFloat w = MIN(MAX(1.0, ceil(fit.width + 10.0)), 180.0);
+    CGFloat cx = CGRectGetWidth(b) * 0.40;
+    CGFloat cy = CGRectGetMinY(sf) + MAX(18.0, CGRectGetHeight(sf))*0.5;
+    CGFloat x = MAX(2.0, MIN(round(cx - w*0.5), CGRectGetWidth(b)-w-2.0));
+    CGFloat y = MAX(0.0, round(cy-h*0.5));
+    self.label.frame = CGRectIntegral(CGRectMake(x,y,w,h));
+}
+- (void)build {
+    if (self.window) return;
+    GTDPassWindow *w = [[GTDPassWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    w.backgroundColor = UIColor.clearColor;
+    w.windowLevel = UIWindowLevelAlert + 997.0;
+    w.userInteractionEnabled = NO;
+    if (@available(iOS 13.0, *)) { UIWindowScene *s = [self foregroundScene]; if (s) w.windowScene = s; }
+    UIViewController *root = [UIViewController new];
+    root.view.backgroundColor = UIColor.clearColor;
+    root.view.userInteractionEnabled = NO;
+    w.rootViewController = root;
+
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
+    l.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.18];
+    l.textColor = UIColor.whiteColor;
+    l.textAlignment = NSTextAlignmentCenter;
+    l.layer.cornerRadius = 5.0;
+    l.layer.masksToBounds = YES;
+    l.userInteractionEnabled = NO;
+    if ([UIFont respondsToSelector:@selector(monospacedDigitSystemFontOfSize:weight:)]) l.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightSemibold];
+    else l.font = [UIFont boldSystemFontOfSize:10.5];
+    l.text = @"DMK --/120";
+    [root.view addSubview:l];
+    self.window = w;
+    self.label = l;
+    [self layout];
+    w.hidden = NO;
+}
+- (void)tick:(NSTimer *)timer {
+    (void)timer;
+    GTDProbeExactClasses();
+    CFTimeInterval now = CACurrentMediaTime();
+    uint64_t count = __sync_fetch_and_add(&gDmkTickCount, 0);
+    double fps = 0.0;
+    if (self.lastTime > 0.0 && now > self.lastTime && count >= self.lastCount) {
+        double dt = now - self.lastTime;
+        uint64_t delta = count - self.lastCount;
+        if (dt > 0.10 && delta > 0) {
+            double raw = (double)delta / dt;
+            if (self.smoothFPS <= 0.0) self.smoothFPS = raw;
+            else self.smoothFPS = self.smoothFPS * 0.45 + raw * 0.55;
+            fps = self.smoothFPS;
+        } else if (dt > 0.10 && delta == 0) {
+            self.smoothFPS = 0.0;
         }
-#pragma clang diagnostic pop
     }
-
-    GTDLog(@"DMK MATCH target=%@ selector=%@ requestFPS=%ld", targetClass, selectorName, (long)(GTDIs120Hz() ? 120 : GTDMaxScreenFPS()));
-    return link;
+    self.lastTime = now;
+    self.lastCount = count;
+    if (gTickHooked && fps > 0.05) self.label.text = [NSString stringWithFormat:@"DMK %.0f/%ld", fps, (long)GTDMaxScreenFPS()];
+    else self.label.text = [NSString stringWithFormat:@"DMK --/%ld", (long)GTDMaxScreenFPS()];
+    [self layout];
 }
-
-static void hookSetPreferredFPS(id self, SEL _cmd, NSInteger fps) {
-    NSInteger adjusted = fps;
-    NSNumber *candidate = objc_getAssociatedObject(self, kGTDCandidateKey);
-    if (candidate.boolValue && GTDIs120Hz() && fps > 0 && fps < 120) {
-        adjusted = 120;
-        GTDLog(@"DMK FPS request %ld -> 120", (long)fps);
-    }
-    if (origSetPreferredFPS) origSetPreferredFPS(self, _cmd, adjusted);
+- (void)start {
+    if (self.timer) return;
+    [self build];
+    self.lastCount = __sync_fetch_and_add(&gDmkTickCount, 0);
+    self.lastTime = CACurrentMediaTime();
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
 }
-
-static void hookSetFrameInterval(id self, SEL _cmd, NSInteger interval) {
-    NSInteger adjusted = interval;
-    NSNumber *candidate = objc_getAssociatedObject(self, kGTDCandidateKey);
-    if (candidate.boolValue && GTDIs120Hz() && interval > 1) {
-        adjusted = 1;
-        GTDLog(@"DMK frameInterval %ld -> 1", (long)interval);
-    }
-    if (origSetFrameInterval) origSetFrameInterval(self, _cmd, adjusted);
-}
-
-static void GTDInstallDisplayLinkHooks(void) {
-    Class dl = [CADisplayLink class];
-    Class meta = object_getClass(dl);
-    Method createM = class_getClassMethod(dl, @selector(displayLinkWithTarget:selector:));
-    if (createM && meta) {
-        MSHookMessageEx(meta, @selector(displayLinkWithTarget:selector:), (IMP)hookCreateDisplayLink, (IMP *)&origCreateDL);
-    }
-
-    Method fpsM = class_getInstanceMethod(dl, @selector(setPreferredFramesPerSecond:));
-    if (fpsM) {
-        MSHookMessageEx(dl, @selector(setPreferredFramesPerSecond:), (IMP)hookSetPreferredFPS, (IMP *)&origSetPreferredFPS);
-    }
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    Method intervalM = class_getInstanceMethod(dl, @selector(setFrameInterval:));
-    if (intervalM) {
-        MSHookMessageEx(dl, @selector(setFrameInterval:), (IMP)hookSetFrameInterval, (IMP *)&origSetFrameInterval);
-    }
-#pragma clang diagnostic pop
-
-    GTDLog(@"HOOK DL create=%d fps=%d interval=%d", origCreateDL != NULL, origSetPreferredFPS != NULL, origSetFrameInterval != NULL);
-}
-
-static void GTDScheduleExactHookRetries(void) {
-    const double delays[] = {0.2, 1.0, 3.0, 8.0};
-    for (unsigned int i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
-        double delay = delays[i];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            GTDTryExactSpeedHooks();
-        });
-    }
-}
+@end
 
 %ctor {
     @autoreleasepool {
         NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
         if (![bid isEqualToString:@"tv.danmaku.bilianime"]) return;
 
-        gSeenLinks = [NSMutableSet set];
-        gDumpedClasses = [NSMutableSet set];
         gLogQueue = dispatch_queue_create("com.chatgpt.bilidanmaku120.log", DISPATCH_QUEUE_SERIAL);
+        gDumpedClasses = [NSMutableSet set];
+        gInstalledSpeedKeys = [NSMutableSet set];
+        gOrigDoubleIMPs = [NSMutableDictionary dictionary];
+        gOrigFloatIMPs = [NSMutableDictionary dictionary];
         NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
         [NSFileManager.defaultManager createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
         gLogPath = [docs stringByAppendingPathComponent:@"BiliDanmaku120.log"];
+        GTDLog(@"BiliDanmaku120 0.3.0 START maxScreen=%ld globalCADisplayLinkHook=NO", (long)GTDMaxScreenFPS());
 
-        GTDLog(@"BiliDanmaku120 0.2.2 START maxScreen=%ld", (long)GTDMaxScreenFPS());
-        GTDInstallDisplayLinkHooks();
-        GTDScheduleExactHookRetries();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[GTDOverlay shared] start];
+            const double delays[] = {0.2, 1.0, 2.0, 4.0, 8.0, 15.0};
+            for (unsigned int i = 0; i < sizeof(delays)/sizeof(delays[0]); i++) {
+                double d = delays[i];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ GTDProbeExactClasses(); });
+            }
+        });
     }
 }
